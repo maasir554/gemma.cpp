@@ -331,7 +331,7 @@ HWY_INLINE void QDotKTile148BF16NotNative(
   const size_t kNF = hn::Lanes(df);
   const float* HWY_RESTRICT q_base[kVTileSize];
   for (size_t i = 0; i < kVTileSize; ++i) {
-    q_base[i] = reinterpret_cast<const float*>(q + q_offsets[i]);
+    q_base[i] = HWY_RCAST_ALIGNED(const float*, q + q_offsets[i]);
   }
   const BF16* HWY_RESTRICT k_base = k.Row(pos / (2 * kNF));
   for (size_t i = 0; i < half_cols; ++i, k_base += kNF * 4) {
@@ -433,7 +433,7 @@ HWY_INLINE void QDotKTile148BF16Native(
   const size_t kNF = hn::Lanes(df);
   const float* HWY_RESTRICT q_base[kVTileSize];
   for (size_t i = 0; i < kVTileSize; ++i) {
-    q_base[i] = reinterpret_cast<const float*>(q + q_offsets[i]);
+    q_base[i] = HWY_RCAST_ALIGNED(const float*, q + q_offsets[i]);
   }
   const BF16* HWY_RESTRICT k_base = k.Row(pos / (2 * kNF));
   for (size_t i = 0; i < half_cols; ++i, k_base += kNF * 4) {
@@ -1356,9 +1356,9 @@ HWY_NOINLINE void TileFlashAttentionReturnExpSumsAndMaxLogits(
     // tile base can point to same tile as previous loop iteration, hence no
     // HWY_RESTRICT
     // KVs are unaligned and we only use unaligned loads in this implementation.
-    const KV_T* tile_base =
-        reinterpret_cast<const KV_T*>(kvs[current_kv_idx].RowBytes(
-            (position - current_kv_start_offset) / kTileSize));
+    const KV_T* tile_base = HWY_RCAST_ALIGNED(
+        const KV_T*, kvs[current_kv_idx].RowBytes(
+                         (position - current_kv_start_offset) / kTileSize));
 
     const KV_T* v_tile =
         tile_base + qkv_dim * kTileSize + (pos_in_tile)*qkv_dim;
@@ -1396,7 +1396,7 @@ HWY_NOINLINE void TileFlashAttentionReturnExpSumsAndMaxLogits(
       // After end of the tile, we have kTileSize * 2 bfloat16 for the
       // microscaling scales for K and V.
       const BF16* microscaling_scales_k =
-          reinterpret_cast<const BF16*>(tile_base + qkv_dim * 2 * kTileSize) +
+          HWY_RCAST_ALIGNED(const BF16*, tile_base + qkv_dim * 2 * kTileSize) +
           pos_in_tile;
       MultiplyByScale<kNumQueries>(df, microscaling_scales_k, x_0_p_0, x_0_p_1,
                                    x_1_p_0, x_1_p_1, x_2_p_0, x_2_p_1, x_3_p_0,
@@ -1439,7 +1439,8 @@ HWY_NOINLINE void TileFlashAttentionReturnExpSumsAndMaxLogits(
     if constexpr (IsInt16<Q_T>() && kUseMicroScaling) {
       if (query_idx == 0) {  // update only when needed
         const BF16* microscaling_scales_v =
-            reinterpret_cast<const BF16*>(tile_base + qkv_dim * 2 * kTileSize) +
+            HWY_RCAST_ALIGNED(const BF16*,
+                              tile_base + qkv_dim * 2 * kTileSize) +
             kTileSize + pos_in_tile;
         const PackedSpan<const BF16> scales_span =
             MakeConstSpan(microscaling_scales_v, 2 * hn::Lanes(df));
@@ -1456,7 +1457,7 @@ HWY_NOINLINE void TileFlashAttentionReturnExpSumsAndMaxLogits(
         q_scales_s_ptr, max_v_scale);
     if constexpr (kUseMicroScaling) {
       const BF16* microscaling_scales_v =
-          reinterpret_cast<const BF16*>(tile_base + qkv_dim * 2 * kTileSize) +
+          HWY_RCAST_ALIGNED(const BF16*, tile_base + qkv_dim * 2 * kTileSize) +
           kTileSize + pos_in_tile;
       MultiplyByScale<kNumQueries>(df, microscaling_scales_v, x_0_p_0, x_0_p_1,
                                    x_1_p_0, x_1_p_1, x_2_p_0, x_2_p_1, x_3_p_0,
@@ -1570,6 +1571,9 @@ void DispatchTileFlashAttentionReturnExpSumsAndMaxLogitsInt16(
       last_pos_per_query, att_cap, att_out, exp_denominator_sums, max_logits);
 }
 
+template <typename MatT>
+MatT GetKVTypeHelper(const hwy::Span<const MatPtrT<MatT>>&);
+
 void DispatchTileFlashAttentionReturnExpSumsAndMaxLogitsMatrixAccumulation(
     hwy::Span<const MatPtr> kvs, size_t q_count,
     const BF16* HWY_RESTRICT q_base,
@@ -1578,9 +1582,30 @@ void DispatchTileFlashAttentionReturnExpSumsAndMaxLogitsMatrixAccumulation(
     MatPtrT<float>& att_out, float* HWY_RESTRICT exp_denominator_sums,
     float* HWY_RESTRICT max_logits) {
   CallUpcastedKVs(kvs, [&](const auto& kv_t) {
-    TileFlashAttentionReturnExpSumsAndMaxLogitsBF16_Macro(
-        kv_t, q_count, q_base, {}, start_pos_per_query, last_pos_per_query,
-        att_cap, att_out, exp_denominator_sums, max_logits);
+    using KV_T = decltype(GetKVTypeHelper(kv_t));
+    if constexpr (IsBF16<KV_T>()) {
+      TileFlashAttentionReturnExpSumsAndMaxLogitsBF16(
+          kv_t, q_count, q_base, {}, start_pos_per_query, last_pos_per_query,
+          att_cap, att_out, exp_denominator_sums, max_logits);
+    }
+  });
+}
+
+void DispatchTileFlashAttentionReturnExpSumsAndMaxLogitsMatrixAccumulationInt8(
+    hwy::Span<const MatPtr> kvs, size_t q_count,
+    const int8_t* HWY_RESTRICT q_base, hwy::Span<const float> q_scales,
+    hwy::Span<const size_t> start_pos_per_query,
+    hwy::Span<const size_t> last_pos_per_query, const float att_cap,
+    MatPtrT<float>& att_out, float* HWY_RESTRICT exp_denominator_sums,
+    float* HWY_RESTRICT max_logits) {
+  CallUpcastedKVs(kvs, [&](const auto& kv_t) {
+    using KV_T = decltype(GetKVTypeHelper(kv_t));
+    if constexpr (IsInt8<KV_T>()) {
+      TileFlashAttentionReturnExpSumsAndMaxLogitsBF16(
+          kv_t, q_count, q_base, q_scales, start_pos_per_query,
+          last_pos_per_query, att_cap, att_out, exp_denominator_sums,
+          max_logits);
+    }
   });
 }
 

@@ -1794,15 +1794,20 @@ HWY_API VI32 PerBlock2x2MatMulMaybeEmulate(DN dn, VI8 a, VI8 b, VI32 c) {
 #if HWY_NATIVE_PER_BLOCK_2X2_MATMUL_INT8
   return hn::PerBlock2x2MatMul(dn, a, b, c);
 #else
-  const hn::Repartition<int8_t, DN> di8;
+  using DA = hn::DFromV<VI8>;
+  const DA da;
+  constexpr size_t kMaxA = hn::MaxLanes(da);
   constexpr size_t kMaxN = hn::MaxLanes(dn);
-  HWY_LANES_CONSTEXPR size_t N = hn::Lanes(dn);
-  HWY_ALIGN int8_t in_a[kMaxN * 4];
-  HWY_ALIGN int8_t in_b[kMaxN * 4];
+  constexpr size_t kBufSize = (kMaxA > kMaxN * 4) ? kMaxA : (kMaxN * 4);
+  using T_IN = hn::TFromD<DA>;
+  HWY_ALIGN T_IN in_a[kBufSize];
+  HWY_ALIGN T_IN in_b[kBufSize];
   HWY_ALIGN int32_t expected[kMaxN];
-  hn::Store(a, di8, in_a);
-  hn::Store(b, di8, in_b);
+  hn::Store(a, da, in_a);
+  hn::Store(b, da, in_b);
   hn::Store(c, dn, expected);
+
+  HWY_LANES_CONSTEXPR size_t N = hn::Lanes(dn);
 
   for (size_t block = 0; block < N; block += 4) {
     const size_t block_i8 = block * 4;
